@@ -14,7 +14,13 @@
  * and Source Han's own cut for the region, and the faces only one of them
  * has (a Japanese hand, a Korean gothic) only for that one. A Latin face
  * made in Japan (Klee One) has the Japanese shapes too: for Chinese and
- * Korean it sets only what has no such characters in it. */
+ * Korean it sets only what has no such characters in it.
+ *
+ * And a string with letters neither face has -- Arabic, Hebrew, Thai,
+ * Devanagari -- is set in a face fontconfig finds for them, the role's
+ * wide face asked for with those letters wanted (desk_font_family_wide):
+ * readable, if not joined up or set right to left, which the toy API
+ * cannot do. */
 
 #include "fonts.h"
 
@@ -101,6 +107,7 @@ static const char *const CUTS[][REGIONS] = {
 struct chosen {
 	const char *latin, *wide;
 	FcCharSet *cs;          /* the letters the Latin face has */
+	FcCharSet *wcs;         /* and the wide one */
 };
 static struct chosen g_chosen[REGIONS][DESK_FONT_COUNT];
 static atomic_bool g_ready[REGIONS];
@@ -206,6 +213,7 @@ static const struct chosen *chosen(int r)
 				c[i].wide = first_installed(ROLES[i].wide, r, true);
 				c[i].cs = strcmp(c[i].latin, c[i].wide) == 0 ? NULL
 					: charset_of(c[i].latin);
+				c[i].wcs = charset_of(c[i].wide);
 			}
 			atomic_store(&g_ready[r], true);
 		}
@@ -231,6 +239,185 @@ static unsigned next_letter(const unsigned char **s)
 	return c;
 }
 
+/* What is in text but not for seeing: joiners and marks of direction,
+ * variation selectors, tags -- no face need have them. */
+static bool ignorable(unsigned c)
+{
+	return c < 0x20 || (c >= 0x200b && c <= 0x200f) || (c >= 0x202a && c <= 0x202e)
+		|| (c >= 0x2060 && c <= 0x206f) || (c >= 0xfe00 && c <= 0xfe0f) || c == 0xfeff
+		|| c >= 0xe0000;
+}
+
+/* The first letter of text a face has not got; 0 if it has them all. */
+static unsigned first_missing(const FcCharSet *cs, const char *text)
+{
+	if (!cs || !text) {
+		return 0;
+	}
+	for (const unsigned char *p = (const unsigned char *)text; *p;) {
+		unsigned c = next_letter(&p);
+		if (!ignorable(c) && !FcCharSetHasChar(cs, c)) {
+			return c;
+		}
+	}
+	return 0;
+}
+
+/* Faces found for letters the chosen ones have not got, by the role and
+ * the block of 128 the first such letter is in (or that none was found). */
+#define FALLBACKS 64
+static struct {
+	int region, role;
+	unsigned block;
+	bool none;
+	char family[96];
+} g_fall[FALLBACKS];
+static int g_fall_n;
+
+/* The language a letter is written in, for the scripts the wide faces
+ * have not got: fontconfig keeps its best faces for each by language. */
+static const char *lang_of(unsigned c)
+{
+	static const struct {
+		unsigned from, to;
+		const char *lang;
+	} SCRIPTS[] = {
+		{ 0x0530, 0x058f, "hy" }, { 0x0590, 0x05ff, "he" }, { 0x0600, 0x06ff, "ar" },
+		{ 0x0700, 0x074f, "syr" }, { 0x0750, 0x077f, "ar" }, { 0x0780, 0x07bf, "dv" },
+		{ 0x08a0, 0x08ff, "ar" }, { 0x0900, 0x097f, "hi" }, { 0x0980, 0x09ff, "bn" },
+		{ 0x0a00, 0x0a7f, "pa" }, { 0x0a80, 0x0aff, "gu" }, { 0x0b00, 0x0b7f, "or" },
+		{ 0x0b80, 0x0bff, "ta" }, { 0x0c00, 0x0c7f, "te" }, { 0x0c80, 0x0cff, "kn" },
+		{ 0x0d00, 0x0d7f, "ml" }, { 0x0d80, 0x0dff, "si" }, { 0x0e00, 0x0e7f, "th" },
+		{ 0x0e80, 0x0eff, "lo" }, { 0x0f00, 0x0fff, "bo" }, { 0x1000, 0x109f, "my" },
+		{ 0x10a0, 0x10ff, "ka" }, { 0x1200, 0x139f, "am" }, { 0x1780, 0x17ff, "km" },
+		{ 0x1800, 0x18af, "mn" }, { 0xfb1d, 0xfb4f, "he" }, { 0xfb50, 0xfdff, "ar" },
+		{ 0xfe70, 0xfeff, "ar" },
+	};
+	for (size_t i = 0; i < sizeof SCRIPTS / sizeof SCRIPTS[0]; i++) {
+		if (c >= SCRIPTS[i].from && c <= SCRIPTS[i].to) {
+			return SCRIPTS[i].lang;
+		}
+	}
+	return NULL;
+}
+
+/* A face's English name, else its first. */
+static const char *english_family(FcPattern *font)
+{
+	FcChar8 *name = NULL, *lang = NULL, *first = NULL;
+	for (int i = 0; FcPatternGetString(font, FC_FAMILY, i, &name) == FcResultMatch; i++) {
+		if (!first) {
+			first = name;
+		}
+		if (FcPatternGetString(font, FC_FAMILYLANG, i, &lang) == FcResultMatch
+			&& strcmp((const char *)lang, "en") == 0) {
+			return (const char *)name;
+		}
+	}
+	return (const char *)first;
+}
+
+/* A face that has the letters of text, for its role (style: serif,
+ * sans-serif, monospace) and the language of the letter missed, as
+ * fontconfig orders them: those with the letter missed and as many of the
+ * rest as there are first. Unifont -- every letter there is, drawn in
+ * pixels -- only when nothing else has it. */
+static bool fall_find(const char *style, const char *text, unsigned missed, char *out, size_t n)
+{
+	FcCharSet *want = FcCharSetCreate();
+	if (!want) {
+		return false;
+	}
+	for (const unsigned char *p = (const unsigned char *)text; *p;) {
+		unsigned c = next_letter(&p);
+		if (!ignorable(c)) {
+			FcCharSetAddChar(want, c);
+		}
+	}
+	FcPattern *pat = FcPatternCreate();
+	FcPatternAddString(pat, FC_FAMILY, (const FcChar8 *)style);
+	FcPatternAddCharSet(pat, FC_CHARSET, want);
+	FcPatternAddBool(pat, FC_SCALABLE, FcTrue);
+	const char *lang = lang_of(missed);
+	if (lang) {
+		FcPatternAddString(pat, FC_LANG, (const FcChar8 *)lang);
+	}
+	FcConfigSubstitute(NULL, pat, FcMatchPattern);
+	FcDefaultSubstitute(pat);
+	FcResult r;
+	FcFontSet *fs = FcFontSort(NULL, pat, FcFalse, NULL, &r);
+	const char *best = NULL, *last_resort = NULL;
+	for (int i = 0; fs && i < fs->nfont && !best; i++) {
+		FcCharSet *got = NULL;
+		if (FcPatternGetCharSet(fs->fonts[i], FC_CHARSET, 0, &got) != FcResultMatch || !got
+			|| !FcCharSetHasChar(got, missed)) {
+			continue;
+		}
+		const char *family = english_family(fs->fonts[i]);
+		if (!family) {
+			continue;
+		}
+		if (strncmp(family, "Unifont", 7) == 0) {
+			last_resort = last_resort ? last_resort : family;
+		} else {
+			best = family;
+		}
+	}
+	bool ok = false;
+	if (best || last_resort) {
+		snprintf(out, n, "%s", best ? best : last_resort);
+		ok = true;
+	}
+	if (fs) {
+		FcFontSetDestroy(fs);
+	}
+	FcPatternDestroy(pat);
+	FcCharSetDestroy(want);
+	return ok;
+}
+
+/* the kind of face each role is, for finding another of the kind */
+static const char *const STYLE[DESK_FONT_COUNT] = {
+	[DESK_FONT_UI] = "sans-serif", [DESK_FONT_PRINT] = "serif", [DESK_FONT_DISPLAY] = "serif",
+	[DESK_FONT_ENGRAVE] = "sans-serif", [DESK_FONT_TYPE] = "monospace",
+	[DESK_FONT_SCREEN] = "monospace", [DESK_FONT_HAND] = "serif",
+};
+
+static const char *fall_back(int r, int f, unsigned missed, const char *text, const char *near)
+{
+	unsigned block = missed >> 7;
+	const char *found = NULL;
+	pthread_mutex_lock(&g_choosing);
+	for (int i = 0; i < g_fall_n; i++) {
+		if (g_fall[i].region == r && g_fall[i].role == f && g_fall[i].block == block) {
+			found = g_fall[i].none ? near : g_fall[i].family;
+			break;
+		}
+	}
+	if (!found && g_fall_n < FALLBACKS) {
+		int i = g_fall_n++;
+		g_fall[i].region = r;
+		g_fall[i].role = f;
+		g_fall[i].block = block;
+		g_fall[i].none = !fall_find(STYLE[f], text, missed, g_fall[i].family,
+			sizeof g_fall[i].family);
+		found = g_fall[i].none ? near : g_fall[i].family;
+	}
+	pthread_mutex_unlock(&g_choosing);
+	return found ? found : near;
+}
+
+const char *desk_font_family_wide(enum desk_font f, const char *text)
+{
+	int r = atomic_load(&g_region);
+	const struct chosen *ch = chosen(r);
+	if (f < 0 || f >= DESK_FONT_COUNT) {
+		f = DESK_FONT_UI;
+	}
+	unsigned missed = first_missing(ch[f].wcs, text);
+	return missed ? fall_back(r, f, missed, text, ch[f].wide) : ch[f].wide;
+}
+
 const char *desk_font_family(enum desk_font f, const char *text)
 {
 	int r = atomic_load(&g_region);
@@ -242,13 +429,14 @@ const char *desk_font_family(enum desk_font f, const char *text)
 		return g_wide_default ? ch[f].wide : ch[f].latin;
 	}
 	if (!ch[f].cs) {
-		return ch[f].latin;
+		return desk_font_family_wide(f, text);
 	}
 	for (const unsigned char *p = (const unsigned char *)text; *p;) {
 		unsigned c = next_letter(&p);
 		/* (from U+2E80 on: the CJK radicals, kana, hangul, ideographs) */
-		if (c >= 0x20 && (!FcCharSetHasChar(ch[f].cs, c) || (r != REG_JP && c >= 0x2e80))) {
-			return ch[f].wide;
+		if (c >= 0x20 && !ignorable(c)
+			&& (!FcCharSetHasChar(ch[f].cs, c) || (r != REG_JP && c >= 0x2e80))) {
+			return desk_font_family_wide(f, text);
 		}
 	}
 	return ch[f].latin;

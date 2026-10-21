@@ -99,6 +99,9 @@
 #include <wlr/types/wlr_output_management_v1.h>
 #include <wlr/types/wlr_output_power_management_v1.h>
 #include <wlr/types/wlr_pointer.h>
+#include <wlr/types/wlr_pointer_constraints_v1.h>
+#include <wlr/types/wlr_relative_pointer_v1.h>
+#include <wlr/util/region.h>
 #include <wlr/types/wlr_touch.h>
 #include <wlr/types/wlr_primary_selection.h>
 #include <wlr/types/wlr_primary_selection_v1.h>
@@ -380,6 +383,7 @@ struct desk_idle_hold {
 struct desk_toplevel {
 	struct wl_list link;
 	struct desk_server *server;
+	bool above;      /* kept in front of the other sheets: a picture-in-picture */
 	struct wlr_xdg_toplevel *xdg_toplevel;
 	struct wlr_xwayland_surface *xsurface;
 	struct wlr_scene_tree *scene_tree;
@@ -546,6 +550,13 @@ struct agd_flight {
 enum { AGD_FLY_NONE, AGD_FLY_TO_CAL, AGD_FLY_TO_BINDER, AGD_FLY_OFF };
 enum { AGD_ON_BINDER, AGD_ON_CAL };
 
+/* Keep destruction handlers for client-owned pointer constraints. */
+struct desk_game_constraint {
+	struct desk_server *server;
+	struct wlr_pointer_constraint_v1 *constraint;
+	struct wl_listener destroy;
+};
+
 struct desk_server {
 	struct wl_display *wl_display;
 	struct wlr_backend *backend;
@@ -629,6 +640,15 @@ struct desk_server {
 	struct wl_listener new_input;
 	struct wl_listener request_cursor;
 	struct wl_listener pointer_focus_change;
+	/* Wayland games use relative motion and pointer constraints to look around. */
+	struct wlr_relative_pointer_manager_v1 *relative_pointer_manager;
+	struct wlr_pointer_constraints_v1 *pointer_constraints;
+	struct wlr_pointer_constraint_v1 *active_constraint;
+	/* where a pointer that says where it is (a tablet, a virtual machine's)
+	 * last was, to make its movement from while a game holds it still */
+	double abs_x, abs_y;
+	bool abs_seen;
+	struct wl_listener new_pointer_constraint;
 	/* Typing into programs' windows through the input method (text-input,
 	 * ti_*): the windows' text inputs, the one the input method is typing
 	 * into, and for each key whether it is waiting on the input method's
@@ -1106,8 +1126,16 @@ struct desk_server {
 		cairo_surface_t *sheet;
 		unsigned id;
 		int x, y, w, h;
+		bool placed;         /* put somewhere by hand: kept there */
+		double fx, fy;       /* where, as a part of the desk's width and height */
 	} pb_paper[6];
 	int pb_papers;
+	/* A letter in the hand: which (+1; 0 none), where on it it was taken
+	 * hold of, where the hand went down, and whether it has moved since --
+	 * a letter clicked and not moved is put away, as before. */
+	int pp_held;
+	double pp_hx, pp_hy, pp_px, pp_py;
+	bool pp_moved;
 	/* Clicked from up at the bookcase: you have to come back down to the
 	 * desk before you can turn to something on it, so the second move
 	 * waits for the first to land. */
@@ -2041,6 +2069,7 @@ static void paper_tick(struct desk_server *server)
 }
 
 static void focus_toplevel(struct desk_toplevel *toplevel);
+static void views_above_raise(struct desk_server *server);
 
 /* DESK_SLOW=n: everything that moves takes n times as long, to be
  * watched (or photographed) a frame at a time. */
@@ -3358,6 +3387,7 @@ static void show_stop(struct desk_server *server, bool skipped);
 static void show_tick(struct desk_server *server);
 static void show_midnight_check(struct desk_server *server);
 static void drawer_toggle(struct desk_server *server);
+static void fullscreen_layer_order(struct desk_server *server);
 static int drawer_lift(struct desk_server *server);
 static double drawer_line(struct desk_server *server);
 static int drawer_index_of(struct desk_server *server, const struct desk_sheet *sheet);
@@ -8293,6 +8323,12 @@ static void papers_place(struct desk_server *server, int w, int h)
 	for (int i = 0; i < server->pb_papers; i++) {
 		struct desk_paper *pp = &server->pb_paper[i];
 		paper_place(pp, w, h, i);
+		if (pp->placed) {
+			/* where it was put, on a desk of another size the same part
+			 * of the way across */
+			pp->x = (int)lround(pp->fx * w);
+			pp->y = (int)lround(pp->fy * h);
+		}
 		if (pp->node) {
 			wlr_scene_buffer_set_dest_size(pp->node, pp->w, pp->h);
 			wlr_scene_node_set_position(&pp->node->node, pp->x, pp->y);
@@ -8846,6 +8882,10 @@ static void post_land(struct desk_server *server)
 		memmove(&server->pb_paper[0], &server->pb_paper[1],
 			(size_t)(server->pb_papers - 1) * sizeof server->pb_paper[0]);
 		server->pb_papers--;
+		/* (the one in the hand is one further down now, or gone) */
+		if (server->pp_held > 0) {
+			server->pp_held--;
+		}
 		papers_place(server, w, h);
 	}
 	struct desk_paper *pp = &server->pb_paper[server->pb_papers++];
@@ -8892,8 +8932,83 @@ static void post_paper_away(struct desk_server *server, int i)
 	memmove(&server->pb_paper[i], &server->pb_paper[i + 1],
 		(size_t)(server->pb_papers - i - 1) * sizeof server->pb_paper[0]);
 	server->pb_papers--;
+	if (server->pp_held == i + 1) {
+		server->pp_held = 0;
+	} else if (server->pp_held > i + 1) {
+		server->pp_held--;
+	}
 	papers_place(server, server->desk_w, server->desk_h);
 	server_schedule_frames(server);
+}
+
+static bool paper_release(struct desk_server *server);
+
+/* The letter in the hand follows it, once it has moved more than a
+ * twitch: picked up, it comes over everything on the desk. */
+static bool paper_drag(struct desk_server *server)
+{
+	if (server->pp_held <= 0 || server->pp_held > server->pb_papers) {
+		return false;
+	}
+	/* the door shut, or the bookcase, the set or the post box come up,
+	 * with it in the hand: it is put down where it is */
+	if (locked(server) || shelf_up(server) || console_up(server) || post_up(server)) {
+		if (server->pp_moved) {
+			paper_release(server);
+		}
+		server->pp_held = 0;
+		return false;
+	}
+	struct desk_paper *pp = &server->pb_paper[server->pp_held - 1];
+	double cx = server->cursor->x, cy = server->cursor->y;
+	if (!server->pp_moved) {
+		double twitch = 5.0 * desk_px_per_pt(server->desk_w);
+		if (hypot(cx - server->pp_px, cy - server->pp_py) < twitch) {
+			return true;
+		}
+		server->pp_moved = true;
+		if (pp->node) {
+			wlr_scene_node_raise_to_top(&pp->node->node);
+			views_above_raise(server);
+		}
+		snd_at(server, DESK_SND_PAPER_SWING, cx, 0.35);
+	}
+	/* kept on the desk: at least a corner of it in reach */
+	int w = server->desk_w, h = server->desk_h;
+	double x = fmin(fmax(cx - server->pp_hx, 32.0 - pp->w), w - 32.0);
+	double y = fmin(fmax(cy - server->pp_hy, 0.0), h - 32.0);
+	pp->x = (int)lround(x);
+	pp->y = (int)lround(y);
+	if (pp->node) {
+		wlr_scene_node_set_position(&pp->node->node, pp->x, pp->y);
+	}
+	server_schedule_frames(server);
+	return true;
+}
+
+/* Let go of the letter in the hand: put down where it is, or -- clicked
+ * and not moved -- put away. True if there was one. */
+static bool paper_release(struct desk_server *server)
+{
+	if (server->pp_held <= 0) {
+		return false;
+	}
+	int i = server->pp_held - 1;
+	server->pp_held = 0;
+	if (i >= server->pb_papers) {
+		return true;
+	}
+	if (!server->pp_moved) {
+		post_paper_away(server, i);
+		return true;
+	}
+	struct desk_paper *pp = &server->pb_paper[i];
+	pp->placed = true;
+	pp->fx = server->desk_w > 0 ? (double)pp->x / server->desk_w : 0.0;
+	pp->fy = server->desk_h > 0 ? (double)pp->y / server->desk_h : 0.0;
+	snd_at(server, DESK_SND_SHEET_DOWN, pp->x + pp->w * 0.5, 0.6);
+	server_schedule_frames(server);
+	return true;
 }
 
 /* The letter lying on the desk that is the uppermost thing under the
@@ -9043,6 +9158,7 @@ static void drawer_toggle(struct desk_server *server)
 	desk_sound_stop_after(server->snd_drawer, real_secs(server->drawer_dur) + SND_SEEN, 0.05);
 	server_schedule_frames(server);
 	drawer_compose(server);
+	fullscreen_layer_order(server);
 }
 
 static void drawer_tick(struct desk_server *server)
@@ -9061,6 +9177,8 @@ static void drawer_tick(struct desk_server *server)
 		server->drawer_t = server->drawer_to;
 		server->drawer_moving = 0;
 		server->snd_drawer = 0;
+		/* home: a game on the whole screen is in front of it again */
+		fullscreen_layer_order(server);
 	}
 	/* Both sheets are baked, so a frame of the animation is two node
 	 * moves -- and what lies on the desk moves with it rather than being
@@ -9466,6 +9584,7 @@ static void base_paint(struct desk_server *server, struct desk_base *b, double o
 	if (fresh) {
 		/* over the windows already on the desk: it was put down on them */
 		wlr_scene_node_raise_to_top(&b->node->node);
+		views_above_raise(server);
 	}
 	wlr_scene_node_set_enabled(&b->node->node, true);
 }
@@ -9477,6 +9596,7 @@ static void base_hand_over(struct desk_server *server, struct desk_base *b)
 	if (view && view->scene_tree) {
 		wlr_scene_node_set_enabled(&view->scene_tree->node, true);
 		wlr_scene_node_raise_to_top(&view->scene_tree->node);
+		views_above_raise(server);
 	}
 	b->state = BASE_GOING;
 	b->at = monotonic_sec();
@@ -10768,6 +10888,17 @@ static cairo_surface_t *view_app(const struct desk_toplevel *view, char *name, s
 	cairo_surface_t *icon = NULL;
 	const struct desk_app_list *l = desk_apps_acquire();
 	const struct desk_app *app = desk_apps_match(l, app_id, cls, inst);
+	/* a script's window is called after its file (thing.py), and one that
+	 * calls itself python3 says nothing: its title does better */
+	char stem[128];
+	if (desk_app_is_interpreter(app_id)) {
+		app_id = NULL;
+	} else if (desk_app_script_stem(app_id, stem, sizeof stem)) {
+		app_id = stem;
+	}
+	if (desk_app_is_interpreter(cls)) {
+		cls = NULL;
+	}
 	if (app) {
 		snprintf(name, n, "%s", app->name);
 		icon = desk_app_icon(app);
@@ -10776,7 +10907,8 @@ static cairo_surface_t *view_app(const struct desk_toplevel *view, char *name, s
 		const char *dot = strrchr(app_id, '.');
 		snprintf(name, n, "%s", dot && dot[1] ? dot + 1 : app_id);
 	} else if (cls && *cls) {
-		snprintf(name, n, "%s", cls);
+		char cstem[128];
+		snprintf(name, n, "%s", desk_app_script_stem(cls, cstem, sizeof cstem) ? cstem : cls);
 	} else {
 		snprintf(name, n, "%s", view_title(view));
 	}
@@ -11855,6 +11987,62 @@ static void reset_cursor_mode(struct desk_server *server)
 	server->grabbed = NULL;
 }
 
+/* A video taken out of its page to float over everything -- Firefox's
+ * and Chromium's picture-in-picture -- is known by its window's title
+ * alone, as the browsers name it in DEsk's languages (compared without
+ * case, spaces or hyphens): Wayland has no "keep this in front". */
+static const char *const PIP_TITLES[] = {
+	"pictureinpicture",          /* Firefox, Chromium */
+	"ピクチャーインピクチャー",
+	"画中画", "子母畫面",
+	"pip모드", "화면속화면",
+	"imagenenimagen", "imagendentrodeimagen", "imagensuperpuesta",
+	"incrustationvidéo", "imagedansl’image", "imagedansl'image",
+	"bildimbild",
+};
+
+static bool view_is_pip(const struct desk_toplevel *view)
+{
+	const char *t = view_title(view);
+	char norm[96];
+	size_t k = 0;
+	for (const char *p = t; p && *p && k + 1 < sizeof norm; p++) {
+		if (*p != ' ' && *p != '-') {
+			norm[k++] = (char)tolower((unsigned char)*p);
+		}
+	}
+	norm[k] = '\0';
+	for (size_t i = 0; i < sizeof PIP_TITLES / sizeof PIP_TITLES[0]; i++) {
+		if (strcmp(norm, PIP_TITLES[i]) == 0) {
+			return true;
+		}
+	}
+	return false;
+}
+
+/* What is kept in front goes back in front, after anything is put over
+ * the windows -- the last of them to have been used on top. */
+static void views_above_raise(struct desk_server *server)
+{
+	struct desk_toplevel *v;
+	wl_list_for_each_reverse(v, &server->toplevels, link) {
+		if (v->above && v->scene_tree && v->scene_tree->node.parent == server->layer_win) {
+			wlr_scene_node_raise_to_top(&v->scene_tree->node);
+		}
+	}
+}
+
+/* Is it (still) one to keep in front? Asked when it comes, and whenever
+ * its title changes. */
+static void view_check_above(struct desk_toplevel *view)
+{
+	bool above = view_is_pip(view);
+	if (above != view->above) {
+		view->above = above;
+		views_above_raise(view->server);
+	}
+}
+
 static void focus_toplevel(struct desk_toplevel *toplevel)
 {
 	if (toplevel == NULL) {
@@ -11875,6 +12063,7 @@ static void focus_toplevel(struct desk_toplevel *toplevel)
 	wlr_scene_node_raise_to_top(&toplevel->scene_tree->node);
 	wl_list_remove(&toplevel->link);
 	wl_list_insert(&server->toplevels, &toplevel->link);
+	views_above_raise(server);
 	if (!view_takes_keys(toplevel) || prev == surface) {
 		/* raised; the keys stay where they were, or are here already */
 		return;
@@ -12254,7 +12443,7 @@ static void side_desks_paint(struct desk_server *server, bool force)
 			continue;
 		}
 		int ow, oh;
-		desk_overlay_size(dw, dh, &ow, &oh);
+		desk_ambient_size(dw, dh, &ow, &oh);
 		double k = clampf_d((double)ow / dw, 0.25, 1.0);
 		int bw = (int)ceil(box.width * k), bh = (int)ceil(box.height * k);
 		struct desk_buf *buf = buf_create(bw, bh);
@@ -12441,6 +12630,30 @@ static int work_clamp_y(struct desk_server *server, int x, int y)
 	return y < wa.y ? wa.y : y;
 }
 
+/* Where the whole screen goes in the room. A film or a game in front of
+ * everything on the desk -- the drawer's handle, the sheets parked at its
+ * edge -- or it is not the whole screen; the drawer pulled out is in front
+ * of the game, as you would pull it out over anything; and the bookcase,
+ * the Control Panel and the post box, the lock and the lamp going out are
+ * in front of it still, being where you look up to from the desk. With
+ * nothing on the whole screen, back where it was, over the windows. */
+static void fullscreen_layer_order(struct desk_server *server)
+{
+	bool any = false;
+	struct desk_toplevel *v;
+	wl_list_for_each(v, &server->toplevels, link) {
+		if (v->fullscreen && v->scene_tree) {
+			any = true;
+			break;
+		}
+	}
+	bool drawer = server->drawer_moving || server->drawer_t > 0.004;
+	struct wlr_scene_tree *over = any && !drawer ? server->layer_parked : server->layer_win;
+	wlr_scene_node_place_above(&server->layer_full->node, &over->node);
+	/* X11 menus over the game they belong to */
+	wlr_scene_node_place_above(&server->layer_xover->node, &server->layer_full->node);
+}
+
 /* The whole screen: off the desk altogether, over everything on it, with
  * no frame and no shadow -- a film, a game, a slide show. And back to the
  * sheet it was, where it was, after. */
@@ -12479,6 +12692,7 @@ static void view_set_fullscreen(struct desk_toplevel *view, bool on)
 		view_set_size(view, view->fs_inner_w, view->fs_inner_h);
 	}
 	wlr_scene_node_raise_to_top(&view->scene_tree->node);
+	fullscreen_layer_order(server);
 tell:
 #ifdef DESK_HAVE_XWAYLAND
 	if (view->xsurface) {
@@ -16010,6 +16224,34 @@ static bool window_under(struct desk_server *server)
 		|| pointer_over(server, server->layer_xover);
 }
 
+/* A game may occupy the fullscreen layer above the whole desk. On an
+ * explicit application switch, return it to its sheet before raising the
+ * next app, or the new window would remain hidden under the game. */
+static void desk_switch_application(struct desk_server *server)
+{
+	struct desk_toplevel *current = view_of_surface(server,
+		server->seat->keyboard_state.focused_surface);
+	if (!current && !wl_list_empty(&server->toplevels)) {
+		current = wl_container_of(server->toplevels.next, current, link);
+	}
+	struct desk_toplevel *next;
+	wl_list_for_each_reverse(next, &server->toplevels, link) {
+		if (next != current && next->scene_tree && !next->unmanaged
+			&& next->sheet.phase == SHEET_IDLE && view_takes_keys(next)) {
+			if (current && current->fullscreen) {
+				view_set_fullscreen(current, false);
+			}
+			focus_toplevel(next);
+			return;
+		}
+	}
+	/* nothing else to go to: a game alone on the whole screen goes back on
+	 * its sheet, and the desk is there */
+	if (current && current->fullscreen) {
+		view_set_fullscreen(current, false);
+	}
+}
+
 static bool handle_keybinding(struct desk_server *server, xkb_keysym_t sym, uint32_t mods)
 {
 	/* Once the lamp starts going out there is nothing to press, nothing to
@@ -16020,6 +16262,11 @@ static bool handle_keybinding(struct desk_server *server, xkb_keysym_t sym, uint
 	}
 	if ((mods & (WLR_MODIFIER_ALT | WLR_MODIFIER_LOGO)) && sym == XKB_KEY_Escape) {
 		end_begin(server, END_LOG_OUT);
+		return true;
+	}
+	/* Alt+Tab should be a compositor shortcut even when a game has focus. */
+	if ((mods & WLR_MODIFIER_ALT) && sym == XKB_KEY_Tab) {
+		desk_switch_application(server);
 		return true;
 	}
 	if (card_keys(server, sym)) {
@@ -16106,15 +16353,33 @@ static bool handle_keybinding(struct desk_server *server, xkb_keysym_t sym, uint
 			}
 			return true;
 		case XKB_KEY_Tab:
-			if (wl_list_length(&server->toplevels) >= 2) {
-				struct desk_toplevel *next = wl_container_of(server->toplevels.prev, next, link);
-				focus_toplevel(next);
+			desk_switch_application(server);
+			return true;
+		case XKB_KEY_f:
+		case XKB_KEY_F:
+			/* Super+F gives games without a fullscreen setting one anyway. */
+			if (!shelf_up(server) && !console_up(server) && !post_up(server)) {
+				struct desk_toplevel *v = view_of_surface(server,
+					server->seat->keyboard_state.focused_surface);
+				if (!v && !wl_list_empty(&server->toplevels)) {
+					v = wl_container_of(server->toplevels.next, v, link);
+				}
+				if (v && v->scene_tree && v->sheet.phase == SHEET_IDLE && !v->unmanaged) {
+					view_set_fullscreen(v, !v->fullscreen);
+				}
 			}
 			return true;
 		case XKB_KEY_m:
 		case XKB_KEY_M:
 			if (!wl_list_empty(&server->toplevels)) {
-				struct desk_toplevel *view = wl_container_of(server->toplevels.next, view, link);
+				struct desk_toplevel *view = view_of_surface(server,
+					server->seat->keyboard_state.focused_surface);
+				if (!view) {
+					view = wl_container_of(server->toplevels.next, view, link);
+				}
+				if (view->fullscreen) {
+					view_set_fullscreen(view, false);
+				}
 				view_fold_toggle(view);
 			}
 			return true;
@@ -16154,10 +16419,7 @@ static bool handle_keybinding(struct desk_server *server, xkb_keysym_t sym, uint
 		return true;
 	}
 	if ((mods & WLR_MODIFIER_ALT) && sym == XKB_KEY_F1) {
-		if (wl_list_length(&server->toplevels) >= 2) {
-			struct desk_toplevel *next = wl_container_of(server->toplevels.prev, next, link);
-			focus_toplevel(next);
-		}
+		desk_switch_application(server);
 		return true;
 	}
 	return false;
@@ -16313,7 +16575,7 @@ static void paint_lock_fx(struct desk_server *server, const struct desk_lock_loo
 		return;
 	}
 	int ow, oh;
-	desk_overlay_size(w, h, &ow, &oh);
+	desk_ambient_size(w, h, &ow, &oh);
 	struct desk_buf *buf = buf_create(ow, oh);
 	cairo_save(buf->cr);
 	cairo_scale(buf->cr, (double)ow / w, (double)oh / h);
@@ -16357,7 +16619,7 @@ static void paint_lock(struct desk_server *server)
 	struct lock_args a;
 	lock_look(server, &a.look);
 	int ow, oh;
-	desk_overlay_size(w, h, &ow, &oh);
+	desk_ambient_size(w, h, &ow, &oh);
 	struct desk_buf *buf = buf_create(ow, oh);
 	cairo_save(buf->cr);
 	cairo_scale(buf->cr, (double)ow / w, (double)oh / h);
@@ -16421,7 +16683,7 @@ static void lock_wipe(struct desk_server *server)
 static cairo_surface_t *lock_snap_shelf(struct desk_server *server)
 {
 	int w = server->desk_w, h = server->desk_h, ow, oh;
-	desk_overlay_size(w, h, &ow, &oh);
+	desk_ambient_size(w, h, &ow, &oh);
 	cairo_surface_t *s = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, ow, oh);
 	cairo_t *c = cairo_create(s);
 	cairo_scale(c, (double)ow / w, (double)oh / h);
@@ -16434,7 +16696,7 @@ static cairo_surface_t *lock_snap_shelf(struct desk_server *server)
 static cairo_surface_t *lock_snap_console(struct desk_server *server)
 {
 	int w = server->desk_w, h = server->desk_h, ow, oh;
-	desk_overlay_size(w, h, &ow, &oh);
+	desk_ambient_size(w, h, &ow, &oh);
 	cairo_surface_t *s = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, ow, oh);
 	cairo_t *c = cairo_create(s);
 	cairo_scale(c, (double)ow / w, (double)oh / h);
@@ -18250,7 +18512,7 @@ static void confetti_paint(struct desk_server *server, double t)
 		return;
 	}
 	int ow, oh;
-	desk_overlay_size(w, h, &ow, &oh);
+	desk_ambient_size(w, h, &ow, &oh);
 	struct desk_buf *buf = buf_create(ow, oh);
 	cairo_save(buf->cr);
 	cairo_scale(buf->cr, (double)ow / w, (double)oh / h);
@@ -18658,11 +18920,15 @@ static void server_new_text_input(struct wl_listener *listener, void *data)
 	}
 }
 
+/* Pointer capture follows keyboard focus too, so switching apps releases a game. */
+static void desk_constraint_refresh(struct desk_server *server);
+
 /* the keyboard has gone to another surface: the text inputs follow it */
 static void seat_kb_focus_change(struct wl_listener *listener, void *data)
 {
 	struct desk_server *server = wl_container_of(listener, server, kb_focus_change);
 	struct wlr_seat_keyboard_focus_change_event *ev = data;
+	desk_constraint_refresh(server);
 	if (server->ti_ime && server->ti_ime->ti->focused_surface != ev->new_surface) {
 		ti_detach(server);
 	}
@@ -19376,11 +19642,114 @@ static void server_new_input(struct wl_listener *listener, void *data)
 	wlr_seat_set_capabilities(server->seat, caps);
 }
 
+/* ---- Game pointer support ------------------------------------------------
+ * This intentionally handles only the focused surface. On keyboard focus
+ * changes and pointer leave, a lock is relinquished. No game receives raw
+ * mouse events while another program has focus.
+ */
+/* A game letting go of the pointer it held still may say where over its
+ * window it would like it to be: there. */
+static void constraint_hint_warp(struct desk_server *server, struct wlr_pointer_constraint_v1 *c)
+{
+	if (c->type != WLR_POINTER_CONSTRAINT_V1_LOCKED || !c->current.cursor_hint.enabled
+		|| !c->surface || !c->surface->mapped) {
+		return;
+	}
+	struct desk_toplevel *view = view_of_surface(server, c->surface);
+	struct wlr_scene_node *node = view ? view_content_node(view) : NULL;
+	int lx, ly;
+	if (!node || !wlr_scene_node_coords(node, &lx, &ly)) {
+		return;
+	}
+	double hx = c->current.cursor_hint.x, hy = c->current.cursor_hint.y;
+	wlr_cursor_warp(server->cursor, NULL, lx + hx, ly + hy);
+	wlr_seat_pointer_warp(server->seat, hx, hy);
+	wlr_log(WLR_INFO, "a game let go of the pointer, at %.0f,%.0f on its window", hx, hy);
+}
+
+static void desk_constraint_set(struct desk_server *server,
+	struct wlr_pointer_constraint_v1 *next)
+{
+	struct wlr_pointer_constraint_v1 *old = server->active_constraint;
+	if (next == old) {
+		return;
+	}
+	server->active_constraint = NULL;
+	if (old) {
+		constraint_hint_warp(server, old);
+		/* A one-shot constraint can be destroyed by deactivation. */
+		wlr_pointer_constraint_v1_send_deactivated(old);
+	}
+	if (next) {
+		server->active_constraint = next;
+		/* a pointer that says where it is moves from where the cursor
+		 * is now */
+		server->abs_x = server->cursor->x;
+		server->abs_y = server->cursor->y;
+		server->abs_seen = true;
+		wlr_pointer_constraint_v1_send_activated(next);
+		if (next->type == WLR_POINTER_CONSTRAINT_V1_LOCKED) {
+			wlr_cursor_unset_image(server->cursor);
+		}
+	} else {
+		wlr_cursor_set_xcursor(server->cursor, server->cursor_mgr, "default");
+	}
+}
+
+static void desk_constraint_refresh(struct desk_server *server)
+{
+	struct wlr_surface *under = server->seat->pointer_state.focused_surface;
+	struct wlr_surface *keys = server->seat->keyboard_state.focused_surface;
+	struct wlr_pointer_constraint_v1 *want = NULL;
+	/* and none while you are looking up from the game: at the bookcase, the
+	 * Control Panel, the post box, or into the drawer, the hand is yours */
+	bool away = shelf_up(server) || console_up(server) || post_up(server)
+		|| server->drawer_moving || server->drawer_t > 0.004;
+	if (!locked(server) && !away && under && keys == under
+		&& server->cursor_mode == DESK_CUR_PASSTHROUGH && server->pointer_constraints) {
+		want = wlr_pointer_constraints_v1_constraint_for_surface(
+			server->pointer_constraints, under, server->seat);
+	}
+	desk_constraint_set(server, want);
+}
+
+static void desk_constraint_destroy(struct wl_listener *listener, void *data)
+{
+	(void)data;
+	struct desk_game_constraint *entry = wl_container_of(listener, entry, destroy);
+	if (entry->server->active_constraint == entry->constraint) {
+		/* (a game lets go by taking its hold away) */
+		constraint_hint_warp(entry->server, entry->constraint);
+		entry->server->active_constraint = NULL;
+		wlr_cursor_set_xcursor(entry->server->cursor, entry->server->cursor_mgr, "default");
+	}
+	wl_list_remove(&entry->destroy.link);
+	free(entry);
+}
+
+static void desk_new_pointer_constraint(struct wl_listener *listener, void *data)
+{
+	struct desk_server *server = wl_container_of(listener, server, new_pointer_constraint);
+	struct wlr_pointer_constraint_v1 *constraint = data;
+	struct desk_game_constraint *entry = calloc(1, sizeof *entry);
+	if (!entry) {
+		return;
+	}
+	entry->server = server;
+	entry->constraint = constraint;
+	entry->destroy.notify = desk_constraint_destroy;
+	wl_signal_add(&constraint->events.destroy, &entry->destroy);
+	desk_constraint_refresh(server);
+}
+
 static void seat_request_cursor(struct wl_listener *listener, void *data)
 {
 	struct desk_server *server = wl_container_of(listener, server, request_cursor);
 	struct wlr_seat_pointer_request_set_cursor_event *event = data;
 	struct wlr_seat_client *focused_client = server->seat->pointer_state.focused_client;
+	if (server->active_constraint && server->active_constraint->type == WLR_POINTER_CONSTRAINT_V1_LOCKED) {
+		return;  /* hide the hardware cursor while the game has it locked */
+	}
 	if (focused_client == event->seat_client) {
 		wlr_cursor_set_surface(server->cursor, event->surface, event->hotspot_x, event->hotspot_y);
 	}
@@ -19390,7 +19759,8 @@ static void seat_pointer_focus_change(struct wl_listener *listener, void *data)
 {
 	struct desk_server *server = wl_container_of(listener, server, pointer_focus_change);
 	struct wlr_seat_pointer_focus_change_event *event = data;
-	if (event->new_surface == NULL) {
+	desk_constraint_refresh(server);
+	if (event->new_surface == NULL && !server->active_constraint) {
 		wlr_cursor_set_xcursor(server->cursor, server->cursor_mgr, "default");
 	}
 }
@@ -19583,6 +19953,14 @@ static void process_cursor_motion(struct desk_server *server, uint32_t time)
 		process_cursor_resize(server);
 		return;
 	}
+	/* a letter in the hand */
+	if (paper_drag(server)) {
+		wlr_seat_pointer_clear_focus(server->seat);
+		if (server->pp_moved) {
+			wlr_cursor_set_xcursor(server->cursor, server->cursor_mgr, "fleur");
+		}
+		return;
+	}
 	/* a hand on the clock's volume bar keeps hold of it */
 	if (clock_drag(server)) {
 		return;
@@ -19750,22 +20128,71 @@ static void pointer_over_paper(struct desk_server *server, uint32_t time)
 	}
 }
 
+/* The pointer moved by (dx, dy): a mouse's own movement, or worked out from
+ * where a tablet's or a virtual machine's pointer now is. A game is told
+ * the movement as it is; a game that holds the pointer still keeps it
+ * where it is, and one that keeps it inside its window keeps it there. */
+static void pointer_moved(struct desk_server *server, struct wlr_input_device *dev,
+	double dx, double dy, double udx, double udy, uint32_t time_msec)
+{
+	/* Relative events are required by Wayland and XWayland game clients. */
+	if (server->relative_pointer_manager && (dx != 0.0 || dy != 0.0)) {
+		wlr_relative_pointer_manager_v1_send_relative_motion(server->relative_pointer_manager,
+			server->seat, (uint64_t)time_msec * 1000, dx, dy, udx, udy);
+	}
+	input_seen(server, "the pointer");
+	/* the bookcase or the drawer may have come up, or gone, since */
+	desk_constraint_refresh(server);
+	struct wlr_pointer_constraint_v1 *c = server->active_constraint;
+	if (c && c->type == WLR_POINTER_CONSTRAINT_V1_LOCKED) {
+		return; /* game gets the delta; desktop cursor stays fixed */
+	}
+	if (c && c->type == WLR_POINTER_CONSTRAINT_V1_CONFINED) {
+		double sx, sy;
+		struct wlr_surface *surface = NULL;
+		view_at(server, server->cursor->x, server->cursor->y, &surface, &sx, &sy);
+		double cx, cy;
+		if (surface != c->surface || !wlr_region_confine(&c->region,
+				sx, sy, sx + dx, sy + dy, &cx, &cy)) {
+			return;
+		}
+		dx = cx - sx;
+		dy = cy - sy;
+	}
+	wlr_cursor_move(server->cursor, dev, dx, dy);
+	process_cursor_motion(server, time_msec);
+}
+
 static void server_cursor_motion(struct wl_listener *listener, void *data)
 {
 	struct desk_server *server = wl_container_of(listener, server, cursor_motion);
 	struct wlr_pointer_motion_event *event = data;
-	wlr_cursor_move(server->cursor, &event->pointer->base, event->delta_x, event->delta_y);
-	input_seen(server, "the pointer");
-	process_cursor_motion(server, event->time_msec);
+	pointer_moved(server, &event->pointer->base, event->delta_x, event->delta_y,
+		event->unaccel_dx, event->unaccel_dy, event->time_msec);
 }
 
+/* A pointer that says where it is: the movement is from where the cursor is
+ * -- or, while a game holds the cursor still, from where this pointer last
+ * said it was, the cursor not having gone there. */
 static void server_cursor_motion_absolute(struct wl_listener *listener, void *data)
 {
 	struct desk_server *server = wl_container_of(listener, server, cursor_motion_absolute);
 	struct wlr_pointer_motion_absolute_event *event = data;
-	wlr_cursor_warp_absolute(server->cursor, &event->pointer->base, event->x, event->y);
-	input_seen(server, "the pointer");
-	process_cursor_motion(server, event->time_msec);
+	double lx, ly;
+	wlr_cursor_absolute_to_layout_coords(server->cursor, &event->pointer->base, event->x,
+		event->y, &lx, &ly);
+	desk_constraint_refresh(server);
+	struct wlr_pointer_constraint_v1 *c = server->active_constraint;
+	double fx = server->cursor->x, fy = server->cursor->y;
+	if (c && c->type == WLR_POINTER_CONSTRAINT_V1_LOCKED) {
+		fx = server->abs_seen ? server->abs_x : lx;
+		fy = server->abs_seen ? server->abs_y : ly;
+	}
+	server->abs_x = lx;
+	server->abs_y = ly;
+	server->abs_seen = true;
+	pointer_moved(server, &event->pointer->base, lx - fx, ly - fy, lx - fx, ly - fy,
+		event->time_msec);
 }
 
 static void server_cursor_button(struct wl_listener *listener, void *data)
@@ -19798,6 +20225,9 @@ static void server_cursor_button(struct wl_listener *listener, void *data)
 		return;
 	}
 	if (event->state == WL_POINTER_BUTTON_STATE_RELEASED) {
+		if (event->button == BTN_LEFT && paper_release(server)) {
+			return;
+		}
 		if (server->agd_drag) {
 			/* let go of the ruler */
 			server->agd_drag = false;
@@ -20057,13 +20487,20 @@ static void server_cursor_button(struct wl_listener *listener, void *data)
 	if (card_press(server, event->button)) {
 		return;
 	}
-	/* A letter lying on the desk, uppermost under the pointer: put away.
+	/* A letter lying on the desk, uppermost under the pointer: taken hold
+	 * of -- carried if the hand moves, put away if it is only a click.
 	 * (Asked here: it lies in the windows' layer, and below this a click
 	 * there was taken for a window's, so a letter could not be put away.) */
 	if (event->button == BTN_LEFT) {
 		int pi = post_paper_under(server);
 		if (pi >= 0) {
-			post_paper_away(server, pi);
+			struct desk_paper *pp = &server->pb_paper[pi];
+			server->pp_held = pi + 1;
+			server->pp_moved = false;
+			server->pp_px = server->cursor->x;
+			server->pp_py = server->cursor->y;
+			server->pp_hx = server->cursor->x - pp->x;
+			server->pp_hy = server->cursor->y - pp->y;
 			return;
 		}
 	}
@@ -20989,6 +21426,7 @@ static void xdg_toplevel_map(struct wl_listener *listener, void *data)
 	view_frame_init(toplevel);
 	view_repaint_chrome(toplevel);
 	view_sync_shadow(toplevel);
+	view_check_above(toplevel);
 	focus_toplevel(toplevel);
 	base_after_map(toplevel->server, toplevel);
 	wlr_log(WLR_INFO, "a window comes onto the desk: %s (%s) at %d,%d, %dx%d, %s",
@@ -21024,6 +21462,7 @@ static void xdg_toplevel_unmap(struct wl_listener *listener, void *data)
 	if (toplevel->fullscreen) {
 		toplevel->fullscreen = false;
 		wlr_scene_node_reparent(&toplevel->scene_tree->node, server->layer_win);
+		fullscreen_layer_order(server);
 	}
 	/* the frame and the shadow are ours, not the client's: they go off
 	 * the screen with it */
@@ -21170,6 +21609,7 @@ static void xdg_toplevel_set_title(struct wl_listener *listener, void *data)
 	if (!toplevel->ime_popup) {
 		view_repaint_chrome(toplevel);
 	}
+	view_check_above(toplevel);
 }
 
 static void server_new_xdg_toplevel(struct wl_listener *listener, void *data)
@@ -21575,6 +22015,7 @@ static void xview_map(struct wl_listener *listener, void *data)
 	} else if (xs->maximized_horz || xs->maximized_vert) {
 		view_toggle_max_now(view);
 	}
+	view_check_above(view);
 	focus_toplevel(view);
 	base_after_map(server, view);
 }
@@ -21609,6 +22050,7 @@ static void xview_unmap_now(struct desk_toplevel *view)
 	memset(&view->shadow, 0, sizeof view->shadow);
 	view->chrome_key = 0;
 	view->fullscreen = false;
+	fullscreen_layer_order(server);
 	view->maximized = 0;
 	view->unmanaged = false;
 	if (had_keys) {
@@ -21773,6 +22215,7 @@ static void xview_set_title(struct wl_listener *listener, void *data)
 	(void)data;
 	if (xview_on_desk(view)) {
 		view_repaint_chrome(view);
+		view_check_above(view);
 	}
 }
 
@@ -22111,7 +22554,8 @@ static void usage(const char *argv0)
 		"  Super+Enter     terminal\n"
 		"  Super+Q         close window\n"
 		"  Super/Alt+Esc   quit\n"
-		"  Super+Tab       cycle windows\n"
+		"  Alt/Super+Tab   cycle windows\n"
+		"  Super+F         whole screen / back\n"
 		"  Super+D         open / close drawer\n"
 		"  Super+M         fold / unfold paper\n", argv0);
 }
@@ -22568,6 +23012,13 @@ int main(int argc, char **argv)
 	server.new_input.notify = server_new_input;
 	wl_signal_add(&server.backend->events.new_input, &server.new_input);
 	server.seat = wlr_seat_create(server.wl_display, "seat0");
+	server.relative_pointer_manager = wlr_relative_pointer_manager_v1_create(server.wl_display);
+	server.pointer_constraints = wlr_pointer_constraints_v1_create(server.wl_display);
+	if (server.pointer_constraints) {
+		server.new_pointer_constraint.notify = desk_new_pointer_constraint;
+		wl_signal_add(&server.pointer_constraints->events.new_constraint,
+			&server.new_pointer_constraint);
+	}
 	/* text-input: programs typing through the input method, with DEsk
 	 * as the go-between */
 	wl_list_init(&server.text_inputs);

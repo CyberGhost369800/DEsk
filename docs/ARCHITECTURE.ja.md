@@ -138,7 +138,7 @@ DEsk は **CPU 上の cairo** で `struct desk_buf`（cairo の画像サーフ�
 
 ### 4.7 プロトコル
 
-作る wlroots のグローバル：compositor と subcompositor、xdg-shell、xdg-decoration と KDE の server-decoration、xdg-output、xdg-activation、data-device と primary selection を持つ seat、data-control、text-input-v3、viewporter、presentation-time、single-pixel-buffer、linux-dmabuf（GPU のレンダラーのとき）、screencopy（grim 用）、idle-notify と idle-inhibit、output-management と output-power-management。まだ無いもの：layer-shell、session-lock、gamma-control、input-method-v2、pointer-constraints と relative-pointer。
+作る wlroots のグローバル：compositor と subcompositor、xdg-shell、xdg-decoration と KDE の server-decoration、xdg-output、xdg-activation、data-device と primary selection を持つ seat、data-control、text-input-v3、viewporter、presentation-time、single-pixel-buffer、linux-dmabuf（GPU のレンダラーのとき）、screencopy（grim 用）、idle-notify と idle-inhibit、output-management と output-power-management、pointer-constraints と relative-pointer（ゲーム）。まだ無いもの：layer-shell、session-lock、gamma-control、input-method-v2。
 
 ### 4.8 D-Bus
 
@@ -190,7 +190,7 @@ libsystemd がある（`-Dpost=enabled`）と、DEsk はイベントループの
 | GPU の試運転 | `draw.c` | スレッドではなく子プロセス。ドライバーを信用する前に試します。 |
 | 扉のトレーサ | `draw.c` | ロック画面の場面。描くときはすべてのコアで。 |
 | アプリの走査 | `apps.c` | アプリのディレクトリを歩き、変わらないスナップショットを公開します（`desk_apps_acquire`/`release`）。 |
-| アイコンの仕事 | `apps.c`、`tray.c` | アイコンを探して変換（必要なら ImageMagick で SVG から）。 |
+| アイコンの仕事 | `apps.c`、`tray.c` | アイコンを探して変換（必要なら rsvg-convert、無ければ ImageMagick で SVG から）。 |
 | テクスチャの準備 | `draw.c` | 起動時に紙と木のタイルを作ります。 |
 | ミキサー | `sound.c` | 机の音を混ぜ、libpulse か ALSA に流します。 |
 | 音量 | `panel.c` | `wpctl` でミキサーに聞き、設定します。 |

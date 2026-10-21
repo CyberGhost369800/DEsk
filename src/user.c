@@ -2,6 +2,7 @@
  * lock shows. In the drawing library, so that the preview can show it too. */
 
 #include "lock.h"
+#include "apps.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -59,33 +60,7 @@ static bool is_svg(const char *path)
 /* an SVG into a PNG this size, with whatever is installed (as icons are) */
 static bool raster(const char *svg, const char *png, int px)
 {
-	const char *tool = access("/usr/bin/magick", X_OK) == 0 ? "/usr/bin/magick"
-		: access("/usr/bin/convert", X_OK) == 0 ? "/usr/bin/convert" : NULL;
-	if (!tool) {
-		return false;
-	}
-	char geom[32];
-	snprintf(geom, sizeof geom, "%dx%d", px, px);
-	pid_t pid = fork();
-	if (pid < 0) {
-		return false;
-	}
-	if (pid == 0) {
-		int null = open("/dev/null", O_WRONLY);
-		if (null >= 0) {
-			dup2(null, 1);
-			dup2(null, 2);
-			close(null);
-		}
-		execl(tool, tool, "-background", "none", "-density", "192", svg, "-resize", geom, png,
-			(char *)NULL);
-		_exit(127);
-	}
-	int st = 0;
-	while (waitpid(pid, &st, 0) < 0 && errno == EINTR) {
-		;
-	}
-	return WIFEXITED(st) && WEXITSTATUS(st) == 0 && is_png(png);
+	return desk_svg_raster(svg, png, px) && is_png(png);
 }
 
 cairo_surface_t *desk_lock_picture(void)

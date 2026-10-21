@@ -25,8 +25,14 @@ enum desk_font {
 };
 
 /* The family to set text in role f in: the Latin one, or (text with
- * letters the Latin one does not have) the other. text may be NULL. */
+ * letters the Latin one does not have) the other -- or, for letters
+ * neither has (Arabic, Hebrew, Thai...), one fontconfig finds that has
+ * them. text may be NULL. */
 const char *desk_font_family(enum desk_font f, const char *text);
+/* The same, always from the wide face (the one with Japanese, Chinese and
+ * Korean as well as Latin letters), but for letters it has not got:
+ * names in any script, in one face whatever the script. */
+const char *desk_font_family_wide(enum desk_font f, const char *text);
 
 /* cairo_select_font_face with that family. */
 void desk_font_select(cairo_t *cr, enum desk_font f, const char *text, bool bold,

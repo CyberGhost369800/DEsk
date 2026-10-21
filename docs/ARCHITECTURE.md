@@ -233,8 +233,8 @@ xdg-decoration and KDE server-decoration, xdg-output, xdg-activation, seat
 with data-device and primary selection, data-control, text-input-v3,
 viewporter, presentation-time, single-pixel-buffer, linux-dmabuf (with a
 GPU renderer), screencopy (for grim), idle-notify and idle-inhibit, output-management and
-output-power-management. Not yet provided: layer-shell, session-lock,
-gamma-control, input-method-v2, pointer-constraints and relative-pointer.
+output-power-management, pointer-constraints and relative-pointer (games).
+Not yet provided: layer-shell, session-lock, gamma-control, input-method-v2.
 
 ### 4.8 D-Bus
 
@@ -315,7 +315,7 @@ breaking, CJK breaking and line-start rules).
 | GPU trial | `draw.c` | A child process, not a thread: tries a driver before trusting it. |
 | Door tracer | `draw.c` | The lock screen's scene, on every core when it is drawn. |
 | App scanner | `apps.c` | Walks the application directories and publishes an immutable snapshot (`desk_apps_acquire`/`release`). |
-| Icon jobs | `apps.c`, `tray.c` | Find and convert icons (SVG through ImageMagick when needed). |
+| Icon jobs | `apps.c`, `tray.c` | Find and convert icons (SVG through rsvg-convert, else ImageMagick, when needed). |
 | Texture warm-up | `draw.c` | Makes paper and wood tiles at start-up. |
 | Mixer | `sound.c` | Mixes the desk's sounds and feeds libpulse or ALSA. |
 | Volume | `panel.c` | Asks and sets the mixer through `wpctl`. |

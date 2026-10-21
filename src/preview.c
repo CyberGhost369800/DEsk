@@ -28,6 +28,12 @@ static int write_sounds(const char *dir)
 	FILE *idx = fopen(path, "we");
 	if (!all || !idx) {
 		fprintf(stderr, "cannot write into %s\n", dir);
+		if (all) {
+			fclose(all);
+		}
+		if (idx) {
+			fclose(idx);
+		}
 		return 1;
 	}
 	const int rate = DESK_SFX_RATE;

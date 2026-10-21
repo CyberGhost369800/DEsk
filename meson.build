@@ -1,5 +1,5 @@
 project('desk', 'c',
-  version: '0.1.2',
+  version: '0.1.3',
   default_options: [
     'buildtype=debugoptimized',
     'c_std=c11',
@@ -15,7 +15,7 @@ add_project_arguments(
 )
 # what this release is called, as --version and the session log say it,
 # and its number, as the notification server tells programs that ask
-add_project_arguments('-DDESK_RELEASE="DEsk v0.1.2 (BETA)"',
+add_project_arguments('-DDESK_RELEASE="DEsk v0.1.3 (BETA)"',
   '-DDESK_VERSION="@0@"'.format(meson.project_version()), language: 'c')
 # a variable initialised from itself (x = x) is uninitialised, and in C
 # -Wall does not say so: a keysym once read as garbage that way
@@ -53,6 +53,11 @@ proto_headers = []
 foreach spec : [
   ['xdg-shell-protocol.h', wp / 'stable/xdg-shell/xdg-shell.xml'],
   ['xdg-decoration-unstable-v1-protocol.h', wp / 'unstable/xdg-decoration/xdg-decoration-unstable-v1.xml'],
+  # wlroots' pointer-constraint header includes a scanner-generated enum header.
+  ['pointer-constraints-unstable-v1-protocol.h',
+    wp / 'unstable/pointer-constraints/pointer-constraints-unstable-v1.xml'],
+  ['relative-pointer-unstable-v1-protocol.h',
+    wp / 'unstable/relative-pointer/relative-pointer-unstable-v1.xml'],
   # the screens for display tools (wlr-randr, kanshi, wdisplays) and their
   # power (wlopm): wlr-protocols, which wayland-protocols does not carry,
   # kept in protocols/ -- wlroots' own header for the power one includes it
@@ -290,7 +295,15 @@ install_data('session/desk-portals.conf',
 )
 # xdg-desktop-portal-wlr reads its settings for a desktop only from
 # /etc/xdg (or the user's own), by the desktop's name
-install_data('session/desk-xdpw.conf',
+# (with where its chooser of a screen to share is)
+xdpw_conf = configure_file(
+  input: 'session/desk-xdpw.conf',
+  output: 'desk-xdpw.conf',
+  configuration: {
+    'CHOOSER': get_option('prefix') / get_option('bindir') / 'desk-screen-chooser',
+  },
+)
+install_data(xdpw_conf,
   install_dir: '/etc/xdg/xdg-desktop-portal-wlr',
   rename: 'DEsk',
 )
@@ -328,7 +341,7 @@ install_data(
 # the screen lock's PAM service (it includes "login"); PAM reads only /etc
 install_data('session/pam/desk', install_dir: '/etc/pam.d')
 install_data('scripts/desk-session-helper', 'scripts/desk-screenshot', 'scripts/desk-ctl',
-  'scripts/desk-report',
+  'scripts/desk-report', 'scripts/desk-screen-chooser',
   install_dir: get_option('bindir'),
   install_mode: 'rwxr-xr-x',
 )

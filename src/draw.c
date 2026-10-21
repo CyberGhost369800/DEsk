@@ -7749,13 +7749,116 @@ void desk_warm_tiles(void)
 	pthread_attr_destroy(&at);
 }
 
+/* A tile made again at the size it is laid at, through filter: kept, a few
+ * of them, for whoever lays the same tile at the same size next. Each holds
+ * the tile it was made from, so that no other surface can come to stand at
+ * its address while it is here and be taken for it. */
+#define TILE_SIZED_MAX 16
+static struct {
+	cairo_surface_t *tile, *sized;
+	int w, h;
+	cairo_filter_t filter;
+} g_tile_sized[TILE_SIZED_MAX];
+static int g_tile_sized_next;
+static pthread_mutex_t g_tile_sized_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/* tile at w by h, a reference the caller lets go of */
+static cairo_surface_t *tile_sized(cairo_surface_t *tile, int w, int h, cairo_filter_t filter)
+{
+	pthread_mutex_lock(&g_tile_sized_lock);
+	for (int i = 0; i < TILE_SIZED_MAX; i++) {
+		if (g_tile_sized[i].tile == tile && g_tile_sized[i].w == w && g_tile_sized[i].h == h
+			&& g_tile_sized[i].filter == filter) {
+			cairo_surface_t *s = cairo_surface_reference(g_tile_sized[i].sized);
+			pthread_mutex_unlock(&g_tile_sized_lock);
+			return s;
+		}
+	}
+	pthread_mutex_unlock(&g_tile_sized_lock);
+	int tw = cairo_image_surface_get_width(tile), th = cairo_image_surface_get_height(tile);
+	cairo_surface_t *s = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, w, h);
+	cairo_t *c = cairo_create(s);
+	cairo_scale(c, (double)w / tw, (double)h / th);
+	cairo_pattern_t *pat = cairo_pattern_create_for_surface(tile);
+	/* round the edge it wraps over, as it is laid */
+	cairo_pattern_set_extend(pat, CAIRO_EXTEND_REPEAT);
+	cairo_pattern_set_filter(pat, filter);
+	cairo_set_source(c, pat);
+	cairo_set_operator(c, CAIRO_OPERATOR_SOURCE);
+	cairo_paint(c);
+	cairo_pattern_destroy(pat);
+	cairo_destroy(c);
+	cairo_surface_flush(s);
+	pthread_mutex_lock(&g_tile_sized_lock);
+	int k = g_tile_sized_next;
+	g_tile_sized_next = (k + 1) % TILE_SIZED_MAX;
+	if (g_tile_sized[k].sized) {
+		cairo_surface_destroy(g_tile_sized[k].sized);
+		cairo_surface_destroy(g_tile_sized[k].tile);
+	}
+	g_tile_sized[k].tile = cairo_surface_reference(tile);
+	g_tile_sized[k].sized = cairo_surface_reference(s);
+	g_tile_sized[k].w = w;
+	g_tile_sized[k].h = h;
+	g_tile_sized[k].filter = filter;
+	pthread_mutex_unlock(&g_tile_sized_lock);
+	return s;
+}
+
+/* A tile to lay across cr, repeated: a pixel of it sx by sy units, taken
+ * through filter.
+ *
+ * At its own pixels the tile is copied; at any other size the good and the
+ * best filters look at a square of the tile's pixels for every one laid. A
+ * page of paper on a 4K screen -- the overlay is drawn at 2048 and so the
+ * page at half its size, as it is on any screen at the levels that draw
+ * the overlay smaller -- was 123 ms that way, where at its own size it is
+ * a twentieth of one: every letter written in the book, both its pages.
+ * Smaller, then, the tile is made again at the size it is laid at, through
+ * filter, once, and that laid as near its own pixels as whole pixels come:
+ * bilinear, which costs nothing there, and on average comes within two
+ * levels in 255 of what the filter gave. Larger it is laid as it was. */
+static cairo_pattern_t *tile_pattern(cairo_t *cr, cairo_surface_t *tile, double sx, double sy,
+	cairo_filter_t filter)
+{
+	/* pixels of the target to a pixel of the tile, across and down */
+	double ax = sx, ay = 0.0, bx = 0.0, by = sy;
+	cairo_user_to_device_distance(cr, &ax, &ay);
+	cairo_user_to_device_distance(cr, &bx, &by);
+	double kx = hypot(ax, ay), ky = hypot(bx, by);
+	double mx = 1.0 / sx, my = 1.0 / sy;
+	cairo_surface_t *src = NULL;
+	bool own = fabs(kx - 1.0) < 1e-6 && fabs(ky - 1.0) < 1e-6;
+	if (!own && kx > 0.0 && ky > 0.0 && kx < 1.0 + 1e-6 && ky < 1.0 + 1e-6) {
+		int tw = cairo_image_surface_get_width(tile), th = cairo_image_surface_get_height(tile);
+		int w = (int)lround(tw * fmin(kx, 1.0)), h = (int)lround(th * fmin(ky, 1.0));
+		w = w < 1 ? 1 : w;
+		h = h < 1 ? 1 : h;
+		src = tile_sized(tile, w, h, filter);
+		mx *= (double)w / tw;
+		my *= (double)h / th;
+		filter = CAIRO_FILTER_BILINEAR;
+	}
+	cairo_pattern_t *pat = cairo_pattern_create_for_surface(src ? src : tile);
+	if (src) {
+		cairo_surface_destroy(src);   /* the pattern holds it */
+	}
+	cairo_pattern_set_extend(pat, CAIRO_EXTEND_REPEAT);
+	cairo_pattern_set_filter(pat, filter);
+	if (mx != 1.0 || my != 1.0) {
+		cairo_matrix_t m;
+		cairo_matrix_init_scale(&m, mx, my);
+		cairo_pattern_set_matrix(pat, &m);
+	}
+	return pat;
+}
+
 static void overlay_grain(cairo_t *cr, double x, double y, double w, double h, double a)
 {
 	cairo_save(cr);
 	cairo_rectangle(cr, x, y, w, h);
 	cairo_clip(cr);
-	cairo_pattern_t *pat = cairo_pattern_create_for_surface(grain_tile());
-	cairo_pattern_set_extend(pat, CAIRO_EXTEND_REPEAT);
+	cairo_pattern_t *pat = tile_pattern(cr, grain_tile(), 1.0, 1.0, CAIRO_FILTER_GOOD);
 	cairo_set_source(cr, pat);
 	cairo_paint_with_alpha(cr, a * 0.35);
 	cairo_pattern_destroy(pat);
@@ -7764,14 +7867,7 @@ static void overlay_grain(cairo_t *cr, double x, double y, double w, double h, d
 
 static void fill_tile(cairo_t *cr, cairo_surface_t *tile, double sx, double sy)
 {
-	cairo_pattern_t *pat = cairo_pattern_create_for_surface(tile);
-	cairo_pattern_set_extend(pat, CAIRO_EXTEND_REPEAT);
-	cairo_pattern_set_filter(pat, CAIRO_FILTER_BEST);
-	if (sx != 1.0 || sy != 1.0) {
-		cairo_matrix_t m;
-		cairo_matrix_init_scale(&m, 1.0 / sx, 1.0 / sy);
-		cairo_pattern_set_matrix(pat, &m);
-	}
+	cairo_pattern_t *pat = tile_pattern(cr, tile, sx, sy, CAIRO_FILTER_BEST);
 	cairo_set_source(cr, pat);
 	cairo_paint(cr);
 	cairo_pattern_destroy(pat);
@@ -9617,8 +9713,7 @@ static void paint_paper_back(cairo_t *cr, double x, double y, double w, double h
 	cairo_save(cr);
 	cairo_rectangle(cr, x, y, w, h);
 	cairo_clip(cr);
-	cairo_pattern_t *pat = cairo_pattern_create_for_surface(paper_tile());
-	cairo_pattern_set_extend(pat, CAIRO_EXTEND_REPEAT);
+	cairo_pattern_t *pat = tile_pattern(cr, paper_tile(), 1.0, 1.0, CAIRO_FILTER_GOOD);
 	cairo_set_source(cr, pat);
 	cairo_paint(cr);
 	cairo_pattern_destroy(pat);
@@ -15992,11 +16087,11 @@ static void book_font(cairo_t *cr, double size, bool bold, bool italic)
 }
 
 /* Names in any script, printed: in a face that has Japanese as well as
- * Latin letters (fonts.h). */
-static void book_font_any(cairo_t *cr, double size, bool bold, bool italic)
+ * Latin letters -- or, for one in a script that face has not got, in one
+ * that has (fonts.h). text is what is to be set, or NULL. */
+static void book_font_any(cairo_t *cr, const char *text, double size, bool bold, bool italic)
 {
-	book_font_as(cr, desk_font_family(DESK_FONT_PRINT, "\xe3\x81\x82"), size, bold,
-		italic);
+	book_font_as(cr, desk_font_family_wide(DESK_FONT_PRINT, text), size, bold, italic);
 }
 
 /* text at x, y cut to width w with an ellipsis; how wide it came out */
@@ -16065,7 +16160,7 @@ static void book_entry(cairo_t *cr, const struct book_geom *g, const double r[4]
 		cairo_set_source_rgba(cr, 0.42, 0.10, 0.08, 0.85);
 		cairo_set_line_width(cr, fmax(is * 0.05, 0.8));
 		cairo_stroke(cr);
-		book_font_any(cr, is * 0.50, true, false);
+		book_font_any(cr, a->initial, is * 0.50, true, false);
 		cairo_text_extents_t e;
 		cairo_text_extents(cr, a->initial, &e);
 		cairo_move_to(cr, ix + is * 0.5 - e.x_bearing - e.width * 0.5, iy + is * 0.5 + e.height * 0.42);
@@ -16076,7 +16171,7 @@ static void book_entry(cairo_t *cr, const struct book_geom *g, const double r[4]
 	double shelf_w = w * 0.20;
 	double base = y + rh * 0.50;
 	cairo_set_source_rgb(cr, 0.13, 0.11, 0.09);
-	book_font_any(cr, rh * 0.36, true, false);
+	book_font_any(cr, a->name, rh * 0.36, true, false);
 	double room = w - (tx - x) - shelf_w - rh * 0.4;
 	double nw = book_text(cr, a->name, tx, base, room);
 	if (strcmp(a->name, a->name_c) != 0 && nw < room - rh) {
@@ -16084,12 +16179,12 @@ static void book_entry(cairo_t *cr, const struct book_geom *g, const double r[4]
 		char c[160];
 		snprintf(c, sizeof c, "  %s", a->name_c);
 		cairo_set_source_rgba(cr, 0.40, 0.35, 0.29, 0.90);
-		book_font_any(cr, rh * 0.26, false, true);
+		book_font_any(cr, c, rh * 0.26, false, true);
 		nw += book_text(cr, c, tx + nw, base, room - nw);
 	}
 	if (a->generic[0]) {
 		cairo_set_source_rgba(cr, 0.32, 0.28, 0.23, 0.95);
-		book_font_any(cr, rh * 0.27, false, true);
+		book_font_any(cr, a->generic, rh * 0.27, false, true);
 		book_text(cr, a->generic, tx, y + rh * 0.84, w - (tx - x) - shelf_w - rh * 0.4);
 	}
 	/* the leader, and where it is filed */
@@ -16198,7 +16293,7 @@ static void book_page(cairo_t *cr, int w, int h, const struct book_geom *g,
 			cairo_move_to(cr, lx + ts * 0.3, base);
 			cairo_show_text(cr, TR("write a name, or what it is for\xe2\x80\xa6"));
 		}
-		book_font_any(cr, ts, false, false);
+		book_font_any(cr, shown, ts, false, false);
 		if (shown[0]) {
 			cairo_set_source_rgb(cr, 0.16, 0.15, 0.17);
 			cairo_move_to(cr, lx + ts * 0.3, base);
@@ -16436,7 +16531,7 @@ static void book_plate(cairo_t *cr, const struct book_geom *g, const struct desk
 		cairo_set_source_rgba(cr, R, G, B, 0.85);
 		cairo_set_line_width(cr, fmax(is * 0.035, 1.0));
 		cairo_stroke(cr);
-		book_font_any(cr, is * 0.46, true, false);
+		book_font_any(cr, a->initial, is * 0.46, true, false);
 		cairo_text_extents_t e;
 		cairo_text_extents(cr, a->initial, &e);
 		cairo_move_to(cr, cx - e.x_bearing - e.width * 0.5, iy + is * 0.5 + e.height * 0.42);
@@ -16445,21 +16540,21 @@ static void book_plate(cairo_t *cr, const struct book_geom *g, const struct desk
 	/* its names */
 	double y = iy + is + g->bh * 0.070, tw = fw * 0.84;
 	cairo_set_source_rgb(cr, 0.13, 0.11, 0.09);
-	book_font_any(cr, g->bh * 0.046, true, false);
+	book_font_any(cr, a->name, g->bh * 0.046, true, false);
 	cairo_text_extents_t e;
 	cairo_text_extents(cr, a->name, &e);
 	book_text(cr, a->name, cx - fmin(e.x_advance, tw) * 0.5, y, tw);
 	if (strcmp(a->name, a->name_c) != 0) {
 		y += g->bh * 0.036;
 		cairo_set_source_rgba(cr, 0.40, 0.35, 0.29, 0.95);
-		book_font_any(cr, g->bh * 0.024, false, true);
+		book_font_any(cr, a->name_c, g->bh * 0.024, false, true);
 		cairo_text_extents(cr, a->name_c, &e);
 		book_text(cr, a->name_c, cx - fmin(e.x_advance, tw) * 0.5, y, tw);
 	}
 	if (a->generic[0]) {
 		y += g->bh * 0.038;
 		cairo_set_source_rgba(cr, 0.30, 0.26, 0.21, 0.95);
-		book_font_any(cr, g->bh * 0.027, false, true);
+		book_font_any(cr, a->generic, g->bh * 0.027, false, true);
 		cairo_text_extents(cr, a->generic, &e);
 		book_text(cr, a->generic, cx - fmin(e.x_advance, tw) * 0.5, y, tw);
 	}
@@ -16488,7 +16583,7 @@ static void book_plate(cairo_t *cr, const struct book_geom *g, const struct desk
 	char filed[96];
 	snprintf(filed, sizeof filed, "%s", shelf_label(si));
 	cairo_set_source_rgb(cr, R, G, B);
-	book_font_any(cr, g->bh * 0.026, false, false);
+	book_font_any(cr, filed, g->bh * 0.026, false, false);
 	cairo_text_extents(cr, filed, &e);
 	book_text(cr, filed, cx - fmin(e.x_advance, tw) * 0.5, y, tw);
 	/* and what else it answers to */
@@ -16517,7 +16612,7 @@ static void book_plate(cairo_t *cr, const struct book_geom *g, const struct desk
 		cal_spaced(cr, TR("ALSO FOUND BY"), cx - lw * 0.5, y, ls, lt, true, 0.45, 0.40, 0.33);
 		y += g->bh * 0.032;
 		cairo_set_source_rgba(cr, 0.30, 0.26, 0.21, 0.95);
-		book_font_any(cr, g->bh * 0.022, false, true);
+		book_font_any(cr, kw, g->bh * 0.022, false, true);
 		book_wrap_centred(cr, kw, cx, y, tw, g->bh * 0.030, 2);
 	}
 	/* how to have it */
@@ -16787,7 +16882,7 @@ static void book_cands(cairo_t *cr, const struct book_geom *g, const struct desk
 	cairo_rectangle(cr, sx, sy, sw, sh);
 	cairo_set_source_rgb(cr, 0.99, 0.98, 0.96);
 	cairo_fill(cr);
-	book_font_any(cr, row * 0.62, false, false);
+	book_font_any(cr, NULL, row * 0.62, false, false);
 	for (int i = first; i < last; i++) {
 		double ry = sy + row * 0.15 + row * (i - first);
 		if (i == cur) {
@@ -23433,22 +23528,24 @@ bool desk_scene_view_ready(int screen_w, int screen_h, int which)
  * desk; what it costs is real. On a 3600 wide screen the console's live
  * half was seventeen milliseconds and it is repainted twelve times a
  * second, which is a fifth of a core to watch a needle move. Drawn at 2048
- * it is six -- still finer than the desk it sits on. */
+ * it is six -- still finer than the desk it sits on.
+ *
+ * Except at Ultra, which is drawn at its full size, moving or not: there
+ * the screen's own pixels, up to a 4K screen's worth. Magnified to a 4K
+ * screen from 2048, the book's letters, the calendar's figures and the
+ * clock's were soft enough to be reported, over a room a GPU traces 2560
+ * wide; at the screen's own width a 4K screen takes up to some 500 MB
+ * more (the pictures of the book, the binders, the console...) and a page
+ * of the book turns at two and a half times the cost. Past a 4K screen's
+ * worth of pixels (5K, 8K) they are drawn at that many and magnified the
+ * rest of the way; an ultrawide, wider but of fewer pixels, at its own. */
 #define DESK_OVERLAY_W 2048
+#define DESK_OVERLAY_ULTRA_PX (3840.0 * 2160.0)
 
-void desk_overlay_size(int screen_w, int screen_h, int *ow, int *oh)
+/* the screen's size, or no wider than cap */
+static void overlay_capped(int screen_w, int screen_h, int cap, int *ow, int *oh)
 {
-	/* And by the same token no finer than the room is traced at the
-	 * levels that trace it smaller: over a desk traced 960 wide (Low) the
-	 * lamps and needles are drawn 960 wide, at less than half what a 1440
-	 * screen's worth cost -- the console's tube, repainted six times a
-	 * second, was nine milliseconds a time on a machine of 2010. */
-	int cap = DESK_OVERLAY_W;
-	int rq = ROOM_Q[desk_gfx_level()].cap;
-	if (rq > 0 && rq < cap) {
-		cap = rq;
-	}
-	if (screen_w <= cap || screen_w < 8 || screen_h < 8) {
+	if (screen_w <= cap) {
 		*ow = screen_w;
 		*oh = screen_h;
 		return;
@@ -23458,6 +23555,58 @@ void desk_overlay_size(int screen_w, int screen_h, int *ow, int *oh)
 	if (*oh < 8) {
 		*oh = 8;
 	}
+}
+
+void desk_overlay_size(int screen_w, int screen_h, int *ow, int *oh)
+{
+	if (screen_w < 8 || screen_h < 8) {
+		*ow = screen_w;
+		*oh = screen_h;
+		return;
+	}
+	if (desk_gfx_level() == DESK_GFX_ULTRA) {
+		double px = (double)screen_w * screen_h;
+		if (px <= DESK_OVERLAY_ULTRA_PX) {
+			*ow = screen_w;
+			*oh = screen_h;
+			return;
+		}
+		double f = sqrt(DESK_OVERLAY_ULTRA_PX / px);
+		*ow = (int)(screen_w * f + 0.5);
+		*oh = (int)(screen_h * f + 0.5);
+		return;
+	}
+	/* Not tied to the room at the levels that trace it smaller (Low 960,
+	 * Medium 1280, 2D 640), as it was, to spare the console's tube on a
+	 * machine of 2010: on a 1920 screen at 2D the clock's buttons and the
+	 * calendar's figures came out three times magnified and could not be
+	 * read. What is read is drawn at the screen's pixels at every level;
+	 * what may be soft -- the room, and what only sets the scene over it
+	 * (desk_ambient_size) -- is as small as the level says. On a machine of
+	 * 2010 at 2D on a 1920 screen it costs the book most (a letter written
+	 * in it waited up to 0.36 s rather than 0.03, a page turned in 0.14
+	 * rather than 0.04) and 130 MB; the clock, the calendar, the memo pad,
+	 * the console and the post box cost about what they did. */
+	overlay_capped(screen_w, screen_h, DESK_OVERLAY_W, ow, oh);
+}
+
+/* What is a scene rather than something read -- the door, traced as the
+ * room is, and the pictures of the room it opens on to; the rain, the snow
+ * and the lights at it; the confetti at the New Year; the desk going on
+ * across another screen -- at the size the overlay had before: no finer
+ * than the room is traced at the levels that trace it smaller. At the
+ * screen's width on a 1920 screen at Low, a machine of 2010 was still
+ * tracing the door finely ten seconds after it came down, drawing it
+ * again every frame meanwhile, and showed the rain at 19 frames a second
+ * rather than 46. */
+void desk_ambient_size(int screen_w, int screen_h, int *ow, int *oh)
+{
+	int rq = ROOM_Q[desk_gfx_level()].cap;
+	if (screen_w < 8 || screen_h < 8 || rq <= 0) {
+		desk_overlay_size(screen_w, screen_h, ow, oh);
+		return;
+	}
+	overlay_capped(screen_w, screen_h, rq < DESK_OVERLAY_W ? rq : DESK_OVERLAY_W, ow, oh);
 }
 
 double desk_scene_progress(void)

@@ -2,7 +2,7 @@
 
 # DEsk
 
-**v0.1.2 (BETA)** -- v0.1, the first public release, with fixes and an installer for Fedora. See [RELEASE-NOTES.md](RELEASE-NOTES.md).
+**v0.1.3 (BETA)** -- v0.1, the first public release, with fixes, an installer for Fedora, and games on the whole screen. See [RELEASE-NOTES.md](RELEASE-NOTES.md).
 
 I've created a Discord server!
 You can also report bugs and submit ideas for new features here!
@@ -70,6 +70,24 @@ Then log out and choose **DEsk** on the login screen.
   are kept.
 - Something went wrong? See [Reporting a problem](#reporting-a-problem).
 
+### Uninstall
+
+Log out of DEsk, and from another desktop (or a text console), in the
+folder you installed it from:
+
+```sh
+sudo sh scripts/uninstall.sh
+```
+
+It shows what it will remove and asks first: DEsk's programs and files,
+"DEsk" on the login screen, its settings for the whole machine
+(`/etc/xdg/desk`), and the wlroots the installer built for it
+(`/opt/desk-wlroots`, on Ubuntu, Arch and some Fedoras; `--keep-wlroots`
+leaves it). The packages the installer brought from your distribution stay,
+since other programs may use them, and so does everything of yours: to
+remove that too, `rm -rf ~/.config/desk ~/.local/share/desk
+~/.local/state/desk ~/.cache/desk`.
+
 More options, building by hand and running DEsk in a window are under
 [Build](#build) and [Run](#run).
 
@@ -97,7 +115,8 @@ there -- its material, the light on it, its shadow and the wear of use.
   every program from A to Z, with thumb tabs and a line at the top of the
   page to type into (input methods via IBus work).
 - **The post box is the notification centre** (`Super+N`). Letters show the
-  sender and subject, and a letter taken out lies on the desk.
+  sender and subject, and a letter taken out lies on the desk, where you
+  can carry it anywhere, or click it to put it away.
 - **The Control Panel** (`Super+C`) is a valve-era machine built into the
   back of the desk: real meters, a volume knob, network and Bluetooth
   levers, a fader for the room's lamp and one for the screen's own
@@ -194,7 +213,7 @@ browser, a file manager and a text editor. The drawer's things and
   settings, borrowed programs, sounds, the room, things on the desk.
 - [docs/CONFIGURATION.md](docs/CONFIGURATION.md) -- every setting, file and
   environment variable.
-- [RELEASE-NOTES.md](RELEASE-NOTES.md) -- what is in v0.1.2 and what is known
+- [RELEASE-NOTES.md](RELEASE-NOTES.md) -- what is in v0.1.3 and what is known
   not to work yet.
 - [docs/design.md](docs/design.md) -- the full development log (in Japanese).
 
@@ -309,7 +328,9 @@ Where the screen is drawn by the processor -- no GPU, a virtual machine without
 a level yourself, and says so: a letter in the post box (check the graphics
 drivers, or the virtual machine's settings) and a line in red beside Graphics
 in Shell Settings. 2D Fallback is the same desk with its effects off, not a
-second one, its room traced at a sample a pixel and softened. And a first
+second one, its room traced at a sample a pixel and softened; what is read on
+it -- text, figures, buttons, needles -- is drawn at the screen's own
+resolution at every level, the room alone as small as the level. And a first
 start, which traces the room from nothing, leaves a letter in the middle of
 the desk saying it may take a minute or two, more on some machines, and that
 the desk can be used meanwhile.
@@ -462,7 +483,8 @@ GPU's to trace.
 | `Super+A` | look up at the bookshelf |
 | `Super+C` | the Control Panel |
 | `Super+N` | the post box |
-| `Super+Tab` / `Alt+F1` | cycle windows |
+| `Super+F` | the focused window on the whole screen, and back (games) |
+| `Alt+Tab` / `Super+Tab` / `Alt+F1` | cycle windows (one on the whole screen goes back to its sheet first) |
 | `Esc` | back to the desk |
 | brightness keys | the screen's backlight (or, with none, the lamp) |
 | volume, mute and media keys | the mixer and the player playing (as the clock's MEDIA page) |

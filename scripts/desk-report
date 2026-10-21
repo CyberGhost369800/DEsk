@@ -7,7 +7,8 @@
 #
 # It holds DEsk's version, which Linux, the graphics (card and driver), how
 # the screens and the session were found, the last session's log and the
-# one before, the last install's log, and whether DEsk fell (coredumpctl).
+# one before, the last install's log, whether DEsk fell (coredumpctl), and
+# what the system's journal says of DEsk and the login screen since this boot.
 # Run it as yourself, from a terminal on any desktop or a console -- DEsk
 # need not be running, or even start.
 #
@@ -34,6 +35,20 @@ show() {
 	else
 		echo "(none: $1)"
 	fi
+}
+
+# pkg_version NAME -- the installed version of a package, by whichever
+# package manager there is
+pkg_version() {
+	v=""
+	if command -v dpkg-query >/dev/null 2>&1; then
+		v=$(dpkg-query -W -f='${Version}' "$1" 2>/dev/null)
+	elif command -v rpm >/dev/null 2>&1; then
+		v=$(rpm -q --qf '%{VERSION}-%{RELEASE}' "$1" 2>/dev/null) || v=""
+	elif command -v pacman >/dev/null 2>&1; then
+		v=$(pacman -Q "$1" 2>/dev/null | cut -d' ' -f2)
+	fi
+	echo "$1: ${v:-not installed}"
 }
 
 report() {
@@ -71,6 +86,11 @@ report() {
 	if [ -r /sys/module/nvidia_drm/parameters/modeset ]; then
 		echo "nvidia_drm modeset: $(cat /sys/module/nvidia_drm/parameters/modeset)"
 	fi
+	# how the last session put its screen together (pixman: on the processor,
+	# where screen sharing cannot start) -- and what shares the screen
+	grep -h -m 1 'put together on the processor' "$state/session.log" 2>/dev/null \
+		|| echo "screen: put together on the GPU (or no session.log to say)"
+	pkg_version xdg-desktop-portal-wlr
 
 	section "Settings"
 	for f in /etc/xdg/desk/shell.conf "${XDG_CONFIG_HOME:-$HOME/.config}/desk/shell.conf"; do
@@ -83,6 +103,17 @@ report() {
 		coredumpctl --no-pager info desk 2>/dev/null | sed -n '/Stack trace of thread/,/^$/p' | head -n 30
 	else
 		echo "(coredumpctl not found)"
+	fi
+
+	# What the login screen said when it started the session -- the only
+	# word there is when DEsk did not get as far as its own log
+	section "The journal since this boot: DEsk and the login screen"
+	if command -v journalctl >/dev/null 2>&1; then
+		journalctl -b -q --no-pager -o short-monotonic 2>/dev/null \
+			| grep -E '[ /]desk(-session|-session-helper)?(\[|:)|gdm-wayland-session|gdm-session-worker|gdm-password|sddm-helper|lightdm' \
+			| grep -vE '\((II|\*\*|==|--|WW)\) ' | tail -n 80
+	else
+		echo "(journalctl not found)"
 	fi
 
 	section "Last session: session.log"

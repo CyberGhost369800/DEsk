@@ -12,6 +12,7 @@
 
 #include "media.h"
 
+#include <math.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -41,6 +42,7 @@ struct player {
 	int status;
 	double length;           /* seconds; < 0 unknown */
 	double pos, pos_at;      /* seconds, and when that was so; pos < 0 unknown */
+	double stale;            /* what it goes on adding from the last track; 0 none */
 	double rate;
 	bool can_prev, can_next, can_play, can_pause, can_raise;
 	double active_at;        /* when it last started playing, or changed track */
@@ -265,6 +267,41 @@ static void title_from_url(const char *url, char *out, size_t n)
 	}
 }
 
+/* Where it is by our own count: what it last said, and the time since if
+ * it is playing. < 0 if it has not said. */
+static double where(const struct player *p, double now)
+{
+	if (p->pos < 0.0) {
+		return -1.0;
+	}
+	double s = p->pos;
+	if (p->status == ST_PLAYING && now > p->pos_at) {
+		s += (now - p->pos_at) * p->rate;
+	}
+	return s;
+}
+
+/* Where the player says it is. Some say less than the truth: Spotify, the
+ * track just changed, goes on counting from where the last one had got
+ * to -- what is said is that and the time since, and that is taken off;
+ * and some (Spotify before) say 0 all along while playing, which says
+ * nothing. Anything else is believed. */
+static void told_position(struct player *p, double s, double now)
+{
+	double ours = where(p, now);
+	if (ours >= 0.0) {
+		if (p->stale > 0.0 && fabs(s - p->stale - ours) < 2.0) {
+			s -= p->stale;
+		} else if (s == 0.0 && p->status == ST_PLAYING && ours > 3.0) {
+			return;
+		} else {
+			p->stale = 0.0;
+		}
+	}
+	p->pos = s;
+	p->pos_at = now;
+}
+
 static void read_metadata(struct player *p, sd_bus_message *m, double now)
 {
 	char type;
@@ -310,6 +347,17 @@ static void read_metadata(struct player *p, sd_bus_message *m, double now)
 	char track[256];
 	snprintf(track, sizeof track, "%.100s|%.100s|%.50s", id, title, url);
 	if (strcmp(track, p->track) != 0) {
+		/* another track: from its beginning, whatever the player says
+		 * next, and how far the last had got kept, for a player that
+		 * goes on counting from there */
+		if (p->track[0]) {
+			/* (and a player that went on counting from the track
+			 * before goes on from where it says this one got to) */
+			double said = p->stale + fmax(where(p, now), 0.0);
+			p->stale = said > 2.0 ? said : 0.0;
+			p->pos = 0.0;
+			p->pos_at = now;
+		}
 		str_copy(p->track, sizeof p->track, track);
 		p->since = now;
 		p->active_at = now;
@@ -343,8 +391,7 @@ static void apply(struct player *p, const char *name, sd_bus_message *m, double 
 	} else if (strcmp(name, "Position") == 0) {
 		double us;
 		if (read_number(m, &us)) {
-			p->pos = us / 1e6;
-			p->pos_at = now;
+			told_position(p, us / 1e6, now);
 		}
 	} else if (strcmp(name, "Rate") == 0) {
 		double r;
@@ -618,8 +665,10 @@ static int on_seeked(sd_bus_message *m, void *user, sd_bus_error *err)
 	for (int i = 0; i < MEDIA_MAX; i++) {
 		struct player *p = &g_players[i];
 		if (p->used && strcmp(p->owner, sender) == 0) {
+			/* a jump it says it made is where it is, all of it */
 			p->pos = us / 1e6;
 			p->pos_at = now;
+			p->stale = 0.0;
 		}
 	}
 	changed();

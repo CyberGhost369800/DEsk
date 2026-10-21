@@ -125,6 +125,14 @@ const struct desk_app *desk_apps_for_std(const struct desk_app_list *list, int r
  * name. NULL if nothing fits. */
 const struct desk_app *desk_apps_match(const struct desk_app_list *list,
 	const char *app_id, const char *wm_class, const char *wm_instance);
+/* A script's name without its file's ending (mintinstall.py is
+ * mintinstall) into out; false if name has no script's ending. */
+bool desk_app_script_stem(const char *name, char *out, size_t n);
+/* Is this the name of a program that runs scripts (python3, perl, node)? */
+bool desk_app_is_interpreter(const char *name);
+/* An SVG drawn into a PNG px square, with whatever is installed for it
+ * (rsvg-convert, else ImageMagick); false if nothing could. */
+bool desk_svg_raster(const char *svg, const char *png, int px);
 /* The first character of a name, whole -- a byte of a UTF-8 character is
  * not a character -- upper case if it has one. */
 void desk_initial_of(const char *name, char *out, size_t n);

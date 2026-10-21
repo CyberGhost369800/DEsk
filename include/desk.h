@@ -941,6 +941,10 @@ bool desk_draw_poppers(cairo_t *cr, int w, int h, double t);
  * scale the cairo context by ow/screen_w and give the scene node the
  * screen's size as its destination. */
 void desk_overlay_size(int screen_w, int screen_h, int *ow, int *oh);
+/* The same for what is a scene rather than something read (the door and
+ * what moves at it, the confetti, the desk on another screen): no finer
+ * than the room at the levels that trace it smaller. */
+void desk_ambient_size(int screen_w, int screen_h, int *ow, int *oh);
 
 int desk_write_png(const char *path, int w, int h, bool with_demo_window);
 

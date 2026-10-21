@@ -1,0 +1,54 @@
+#!/bin/sh
+# desk-screen-chooser -- which screen to share, asked for by
+# xdg-desktop-portal-wlr when a program (a browser, a video call) wants to
+# share one. The portal hands the screens in, one a line (its "dmenu"
+# chooser); the one chosen goes out, and nothing when the sharing is turned
+# down. With one screen there is nothing to ask: that one is shared.
+#
+# It asks in a window of zenity, else kdialog, else yad. With none of them
+# the first screen is shared, as it was before there was a question.
+# (slurp, wofi and bemenu, the usual choosers, need a layer-shell, which
+# DEsk does not have.)
+set -u
+
+screens=$(grep -v '^[[:space:]]*$' || true)
+n=$(printf '%s\n' "$screens" | grep -c . || true)
+[ "$n" -gt 0 ] || exit 0
+first=$(printf '%s\n' "$screens" | head -n 1)
+if [ "$n" -eq 1 ]; then
+	printf '%s\n' "$first"
+	exit 0
+fi
+
+# in the desktop's language: DEsk's seven
+lang=${LC_ALL:-${LC_MESSAGES:-${LANG:-en}}}
+case "$lang" in
+ja*) title="画面の共有"; text="どの画面を共有しますか？"; col="画面" ;;
+zh*) title="共享屏幕"; text="要共享哪个屏幕？"; col="屏幕" ;;
+ko*) title="화면 공유"; text="어느 화면을 공유할까요?"; col="화면" ;;
+es*) title="Compartir pantalla"; text="¿Qué pantalla compartir?"; col="Pantalla" ;;
+fr*) title="Partager un écran"; text="Quel écran partager ?"; col="Écran" ;;
+de*) title="Bildschirm teilen"; text="Welchen Bildschirm teilen?"; col="Bildschirm" ;;
+*) title="Share a screen"; text="Which screen should be shared?"; col="Screen" ;;
+esac
+
+if command -v zenity >/dev/null 2>&1; then
+	printf '%s\n' "$screens" | zenity --list --title="$title" --text="$text" \
+		--column="$col" --width=360 --height=320 2>/dev/null
+elif command -v kdialog >/dev/null 2>&1; then
+	# a radio list: each screen its own tag and label, the first chosen
+	set --
+	on=on
+	for s in $screens; do
+		set -- "$@" "$s" "$s" "$on"
+		on=off
+	done
+	kdialog --title "$title" --radiolist "$text" "$@" 2>/dev/null
+elif command -v yad >/dev/null 2>&1; then
+	printf '%s\n' "$screens" | yad --list --title="$title" --text="$text" \
+		--column="$col" --width=360 --height=320 --print-column=1 2>/dev/null \
+		| sed 's/|$//'
+else
+	printf '%s\n' "$first"
+fi
+exit 0

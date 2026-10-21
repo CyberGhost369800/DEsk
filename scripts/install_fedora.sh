@@ -227,6 +227,7 @@ run|a session bus for each login|dbus-broker dbus-daemon
 run|portals: file choosers, screen sharing|xdg-desktop-portal
 run|portals: GTK file chooser|xdg-desktop-portal-gtk
 run|portals: screenshots and screen sharing|xdg-desktop-portal-wlr
+run|screen sharing: asking which screen (zenity)|zenity
 run|screen sharing: the PipeWire session manager|wireplumber
 run|typefaces: Latin and more (Noto Sans)|google-noto-sans-fonts
 run|typefaces: Latin and more (Noto Serif)|google-noto-serif-fonts
@@ -240,6 +241,7 @@ run|screenshots: onto the clipboard|wl-clipboard
 run|screenshots: the letter saying where it went|libnotify
 run|home folders (Documents, Pictures...)|xdg-user-dirs
 run|opening files and links|xdg-utils
+run|apps'"'"' icons drawn from SVG (rsvg-convert)|librsvg2-tools
 run|the weather at the front door (curl)|curl
 app|terminal (Xfce Terminal)|xfce4-terminal
 app|files (Thunar)|Thunar
